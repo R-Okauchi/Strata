@@ -1893,6 +1893,7 @@ const char* name(int t) {
         case kIQ1_S: return "IQ1_S";
         case kIQ1_M: return "IQ1_M";
         case kIQ4_NL: return "IQ4_NL";
+        case kMXFP4: return "MXFP4";
         default: return "?";
     }
 }
