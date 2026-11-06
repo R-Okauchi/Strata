@@ -976,7 +976,9 @@ __device__ __forceinline__ void decode_v(const uint8_t* __restrict__ row, int kb
     }
     decode<T>(row, kb, tab, s);
 }
-template <int T, int NC, int NR>
+// U: a lane's sub-blocks U at a time in the loop (DS4_MV_U=2: the next one's loads go out before this one's sums; the sums
+// in the same order, so the same bits)
+template <int T, int NC, int NR, int U = 1>
 __global__ void __launch_bounds__(kThreads) mv_kernel_nr(const Jobs J) {
     __shared__ uint32_t tab[Ty<T>::TAB > 0 ? Ty<T>::TAB : 1];
     load_tab<T>(tab);
@@ -992,15 +994,29 @@ __global__ void __launch_bounds__(kThreads) mv_kernel_nr(const Jobs J) {
     for (int c = 0; c < NC; ++c) acc[c] = 0.0f;
     if (live) {
         const uint8_t* w = b.w + (size_t) row * b.ld;
-        for (int kb = sl; kb < nsb; kb += LPR) {
-            Sub s;
-            decode_v<T>(w, kb, tab, s);
+        if constexpr (U > 1) {
+#pragma unroll U
+            for (int kb = sl; kb < nsb; kb += LPR) {
+                Sub s;
+                decode_v<T>(w, kb, tab, s);
 #pragma unroll
-            for (int c = 0; c < NC; ++c)
-                if (c < b.ncol) {
-                    const int4* xp = (const int4*) (b.xq + (size_t) c * b.k + (size_t) kb * 32);
-                    acc[c] = fmaf(b.xd[(size_t) c * nsb + kb], sub_dot<T>(s, xp[0], xp[1]), acc[c]);
-                }
+                for (int c = 0; c < NC; ++c)
+                    if (c < b.ncol) {
+                        const int4* xp = (const int4*) (b.xq + (size_t) c * b.k + (size_t) kb * 32);
+                        acc[c] = fmaf(b.xd[(size_t) c * nsb + kb], sub_dot<T>(s, xp[0], xp[1]), acc[c]);
+                    }
+            }
+        } else {
+            for (int kb = sl; kb < nsb; kb += LPR) {
+                Sub s;
+                decode_v<T>(w, kb, tab, s);
+#pragma unroll
+                for (int c = 0; c < NC; ++c)
+                    if (c < b.ncol) {
+                        const int4* xp = (const int4*) (b.xq + (size_t) c * b.k + (size_t) kb * 32);
+                        acc[c] = fmaf(b.xd[(size_t) c * nsb + kb], sub_dot<T>(s, xp[0], xp[1]), acc[c]);
+                    }
+            }
         }
     }
 #pragma unroll
@@ -1395,6 +1411,14 @@ void mv_nc(const Jobs& J, int nj, int max_n, int max_c, cudaStream_t s) {
     int nsb_max = 0;
     for (int j = 0; j < nj; ++j) nsb_max = std::max(nsb_max, J.j[j].k / 32);
     const int nr = nr_env > 0 ? nr_env : nr_env == 0 ? (max_c <= 2 ? 1 : nsb_max <= 160 ? 2 : 1) : -1;
+    static const bool u2 = std::getenv("DS4_MV_U") != nullptr && std::atoi(std::getenv("DS4_MV_U")) == 2;
+    if (nr == 1 && u2) {   // (DS4_MV_U=2: a row a warp, two sub-blocks a step)
+        if (max_c <= 1) strata_ds4_launch(mv_kernel_nr<T, 1, 1, 2>, grid, kThreads, 0, s, J);
+        else if (max_c <= 4) strata_ds4_launch(mv_kernel_nr<T, 4, 1, 2>, grid, kThreads, 0, s, J);
+        else if (max_c <= 8) strata_ds4_launch(mv_kernel_nr<T, 8, 1, 2>, grid, kThreads, 0, s, J);
+        else strata_ds4_launch(mv_kernel_nr<T, 16, 1, 2>, grid, kThreads, 0, s, J);
+        return;
+    }
     if (nr == 1) {   // (the new kernel a row a warp: its 128-bit loads)
         if (max_c <= 1) strata_ds4_launch(mv_kernel_nr<T, 1, 1>, grid, kThreads, 0, s, J);
         else if (max_c <= 4) strata_ds4_launch(mv_kernel_nr<T, 4, 1>, grid, kThreads, 0, s, J);
