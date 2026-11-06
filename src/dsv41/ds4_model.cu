@@ -6928,8 +6928,10 @@ struct Model::Impl {
 #endif
 #if !defined(STRATA_USE_HIP) && !defined(STRATA_METAL)
             {   // DS4_STORE_PINNED=1 (opt-in): each chunk pinned memory from the driver (cudaHostAlloc, mapped), where it lands -
-                // a GB10's GPU reads it at ~230 GB/s against ~163 for the system's pages registered; the CPU and the store's
-                // O_DIRECT reads use it as before, and the prompt path reads its slots in place
+                // a GB10's GPU streams it at ~230 GB/s against ~163 for the system's pages registered, but measured there the
+                // decode's gate / up gained what its down lost (22.1 -> 19.9, 12.4 -> 15.4 ms a window of 3.3 tokens) and the
+                // prompt's kernels read it in place far slower (an agent turn 1.86 -> 2.61 s, 1308 tokens 4.1 -> 7.1 s), as
+                // DS4_STORE_NUMA's memory: off by default
                 const char* pv = std::getenv("DS4_STORE_PINNED");
                 if (!store_numa && gpu_integrated(dev0) && pv != nullptr && std::atoi(pv) != 0) {
                     cfg.chunk_alloc = [dev0](size_t n) -> void* {
