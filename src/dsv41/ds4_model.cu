@@ -1571,6 +1571,7 @@ struct Model::Impl {
     bool zc_in_place = false;          // the store's slots read in place, by decode tokens and verify windows alike
     bool flow_in_place = false;        // the prompt path reads the store's experts where they lie too (zc_in_place; CUDA)
     bool store_numa = false;           // the store's arena is the driver's host memory (HostNumaArena, opt-in), not registered pages
+    bool store_pinned = false;         // its chunks are pinned memory from the driver, each its own (DS4_STORE_PINNED=1)
     // DS4_UMA_TIER=1 on one GPU that shares the PC's memory (a DGX Spark's GB10): one expert tier instead of two. The
     // trunk's experts get no VRAM slots (on such a GPU those are the same RAM, copied there and kept apart from the CPU
     // lane's); the RAM store takes that memory, the GPU reads its slots in place for decode tokens and verify windows,
@@ -6895,7 +6896,40 @@ struct Model::Impl {
                 }
             }
 #endif
-            if (!store_numa) cfg.map_chunk = [dev0](void* h, size_t n) -> void* {
+#if !defined(STRATA_USE_HIP) && !defined(STRATA_METAL)
+            {   // DS4_STORE_PINNED=1 (opt-in): each chunk pinned memory from the driver (cudaHostAlloc, mapped), where it lands -
+                // a GB10's GPU reads it at ~230 GB/s against ~163 for the system's pages registered; the CPU and the store's
+                // O_DIRECT reads use it as before, and the prompt path reads its slots in place
+                const char* pv = std::getenv("DS4_STORE_PINNED");
+                if (!store_numa && gpu_integrated(dev0) && pv != nullptr && std::atoi(pv) != 0) {
+                    cfg.chunk_alloc = [dev0](size_t n) -> void* {
+                        cudaSetDevice(dev0);
+                        void* p = nullptr;
+                        if (cudaHostAlloc(&p, n, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess) {
+                            (void) cudaGetLastError();
+                            return nullptr;
+                        }
+                        return p;
+                    };
+                    cfg.chunk_free = [dev0](void* p, size_t) {
+                        cudaSetDevice(dev0);
+                        cudaFreeHost(p);
+                    };
+                    cfg.map_chunk = [dev0](void* h, size_t) -> void* {
+                        cudaSetDevice(dev0);
+                        void* d = nullptr;
+                        if (cudaHostGetDevicePointer(&d, h, 0) != cudaSuccess) {
+                            (void) cudaGetLastError();
+                            return nullptr;
+                        }
+                        return d;
+                    };
+                    store_pinned = true;
+                    std::fprintf(stderr, "ds4: RAM store: each chunk pinned memory from the driver (DS4_STORE_PINNED=1)\n");
+                }
+            }
+#endif
+            if (!store_numa && !store_pinned) cfg.map_chunk = [dev0](void* h, size_t n) -> void* {
                 cudaSetDevice(dev0);
                 unsigned reg_flags = cudaHostRegisterMapped | cudaHostRegisterPortable;
 #if defined(STRATA_USE_HIP)
@@ -6915,7 +6949,7 @@ struct Model::Impl {
                 if (d != h) std::fprintf(stderr, "ds4: RAM store: chunk host %p -> device %p (not the identity)\n", h, d);
                 return d;
             };
-            if (!store_numa) cfg.unmap_chunk = [dev0](void* h) {
+            if (!store_numa && !store_pinned) cfg.unmap_chunk = [dev0](void* h) {
                 cudaSetDevice(dev0);
                 cudaHostUnregister(h);
             };

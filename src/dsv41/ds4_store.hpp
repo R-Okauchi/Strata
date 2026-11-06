@@ -75,6 +75,11 @@ public:
         std::function<bool(void* p, size_t bytes)> arena_commit;
         std::function<void(void* p, size_t bytes)> arena_decommit;
         std::function<void(void* p, size_t bytes)> arena_release;
+        // or each chunk an allocation of its own, wherever it lands (both set: no range is reserved; e.g. pinned memory from the
+        // GPU driver, which a GPU sharing the PC's memory reads at ~230 GB/s against ~163 for registered pages on a GB10); as the
+        // arena hooks', grown back only at grow_some, never on the read path
+        std::function<void*(size_t bytes)> chunk_alloc;
+        std::function<void(void* p, size_t bytes)> chunk_free;
         size_t reserve = 192;              // slots kept evictable (not visible) for the window's demand and guesses
         int vis_percent = 100;             // the share of experts the GPU may take (by a fixed hash): the rest stay the CPU lane's, so both lanes work
         // bytes of blobs each layer's experts may hold (the budget's share of the hottest, per layer): slot classes sized from it;
@@ -136,6 +141,7 @@ public:
         for (Cls& k : cls_) {   // one reserved range a class (chunks committed as they are needed); the reserve in proportion
             k.reserve = cls_.size() == 1 ? c.reserve : std::max<size_t>(8, (size_t) ((double) c.reserve * (double) k.nmax / (double) nmax_));
             k.arena_bytes = ((k.nmax + kChunk - 1) / kChunk) * kChunk * k.slot_bytes;
+            if (alloc_mem()) continue;   // (no range: each chunk its own allocation)
             k.arena = (uint8_t*) (own_mem() ? cfg_.arena_reserve(k.arena_bytes) : os::range_reserve(k.arena_bytes));
             if (k.arena == nullptr) return false;
         }
@@ -168,6 +174,13 @@ public:
     ~ExpertStore() {
         io_.reset();
         for (Cls& k : cls_) {
+            if (alloc_mem()) {
+                for (size_t i = k.chunks.size(); i-- > 0;) {
+                    if (cfg_.unmap_chunk && k.chunk_dev[i] != nullptr) cfg_.unmap_chunk(k.chunks[i].first);
+                    cfg_.chunk_free(k.chunks[i].first, k.chunks[i].second);
+                }
+                continue;
+            }
             if (k.arena == nullptr) continue;
             for (size_t i = k.chunks.size(); i-- > 0;) {
                 if (cfg_.unmap_chunk && k.chunk_dev[i] != nullptr) cfg_.unmap_chunk(k.chunks[i].first);
@@ -537,7 +550,8 @@ public:
             }
             const size_t c = pc.second;
             if (cfg_.unmap_chunk && k.chunk_dev[c] != nullptr) cfg_.unmap_chunk(k.chunks[c].first);
-            if (own_mem()) cfg_.arena_decommit(k.chunks[c].first, k.chunks[c].second);
+            if (alloc_mem()) cfg_.chunk_free(k.chunks[c].first, k.chunks[c].second);
+            else if (own_mem()) cfg_.arena_decommit(k.chunks[c].first, k.chunks[c].second);
             else os::range_decommit(k.chunks[c].first, k.chunks[c].second);
             k.chunks.pop_back();
             k.chunk_dev.pop_back();
@@ -550,7 +564,10 @@ public:
     }
     size_t shrunk() const { return shrunk_; }
     /// the arena's memory is the caller's (Cfg::arena_*), not the system's pages
-    bool own_mem() const { return cfg_.arena_reserve && cfg_.arena_commit && cfg_.arena_decommit && cfg_.arena_release; }
+    bool own_mem() const {
+        return (cfg_.arena_reserve && cfg_.arena_commit && cfg_.arena_decommit && cfg_.arena_release) || alloc_mem();
+    }
+    bool alloc_mem() const { return cfg_.chunk_alloc && cfg_.chunk_free; }
     /// Own memory grows back here, after shrink_chunks, never on the read path (making it real may wait on the GPU's work, and a
     /// kernel may be waiting on the CPU lane): the RAM grow_some() needs free for its next chunk (its bytes and the floor), 0 when
     /// the arena is whole; grow_some() adds that chunk to the class furthest below its size, at the caller's safe point.
@@ -682,8 +699,9 @@ private:
         const size_t bytes = n * k.slot_bytes;
         const uint64_t avail = cfg_.ram_avail ? cfg_.ram_avail() : ~uint64_t{0};
         if (avail != ~uint64_t{0} && avail < bytes + cfg_.floor_bytes) return false;
-        void* p = k.arena + k.nalloc * k.slot_bytes;
-        if (!(own_mem() ? cfg_.arena_commit(p, bytes) : os::range_commit(p, bytes))) return false;
+        void* p = alloc_mem() ? cfg_.chunk_alloc(bytes) : k.arena + k.nalloc * k.slot_bytes;
+        if (p == nullptr) return false;
+        if (!alloc_mem() && !(own_mem() ? cfg_.arena_commit(p, bytes) : os::range_commit(p, bytes))) return false;
         k.chunks.push_back({p, bytes});
         void* dev = cfg_.map_chunk ? cfg_.map_chunk(p, bytes) : nullptr;
         k.chunk_dev.push_back(dev);
