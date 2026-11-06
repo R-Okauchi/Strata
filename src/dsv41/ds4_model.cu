@@ -14636,6 +14636,14 @@ struct Model::Impl {
                 wa.n_embd = D;
                 wa.n_ff = FF;
                 wa.limit = g.lim;
+                struct WinMark {   // (DS4_PROF_WIN: the window's expert stages apart - gate / up, down, the CPU lane's wait)
+                    Impl* m;
+                    const Dev* d;
+                } wm{this, &d};
+                if (prof_window) {
+                    wa.mark = [](void* c, int stage) { ((WinMark*) c)->m->prof_mark(*((WinMark*) c)->d, stage); };
+                    wa.mark_ctx = &wm;
+                }
                 if (!(lay.fmt == gg::kFmtMXFP4 ? gg::win_experts(wa, s) : x3::win_experts(wa, s))) {
                     err = "exl3 win_experts failed";
                     return false;
