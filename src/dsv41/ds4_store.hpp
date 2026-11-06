@@ -568,9 +568,10 @@ public:
         return (cfg_.arena_reserve && cfg_.arena_commit && cfg_.arena_decommit && cfg_.arena_release) || alloc_mem();
     }
     bool alloc_mem() const { return cfg_.chunk_alloc && cfg_.chunk_free; }
-    /// Own memory grows back here, after shrink_chunks, never on the read path (making it real may wait on the GPU's work, and a
-    /// kernel may be waiting on the CPU lane): the RAM grow_some() needs free for its next chunk (its bytes and the floor), 0 when
-    /// the arena is whole; grow_some() adds that chunk to the class furthest below its size, at the caller's safe point.
+    /// Own memory, or chunks the GPU maps, grows back here, after shrink_chunks, never on the read path (making it real or
+    /// registering it may wait on the GPU's work, and a kernel may be waiting on the CPU lane): the RAM grow_some() needs free
+    /// for its next chunk (its bytes and the floor), 0 when the arena is whole; grow_some() adds that chunk to the class
+    /// furthest below its size, at the caller's safe point.
     uint64_t regrow_need() {
         std::lock_guard<std::mutex> lk(mu_);
         const int k = regrow_class();
@@ -750,7 +751,9 @@ private:
                 k.free_hint = j + 1;
                 return (int) (k.off + j);
             }
-        if (!own_mem() && grow(ci)) return take_slot(ci, demand);   // (own memory grows back at the caller's safe point: grow_some)
+        // (own memory, or chunks the GPU maps, grow back at the caller's safe point - grow_some: registering a chunk for the GPU
+        //  while a decode kernel waits on the CPU lane, the thread taking this slot, waited for good, as the pregrow below notes)
+        if (!own_mem() && !cfg_.map_chunk && grow(ci)) return take_slot(ci, demand);
         int best = -1;
         double bv = 0;
         for (size_t j = 0; j < k.nalloc; ++j) {

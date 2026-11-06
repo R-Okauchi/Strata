@@ -9219,8 +9219,9 @@ struct Model::Impl {
         const uint64_t avail = ram_avail();
         if (avail == ~uint64_t{0}) return;
         if (avail >= (4ull << 30)) {
-            // (an arena of the driver's memory grows back here, the GPU's work done first - never on the read path, see regrow_need)
-            if (store->own_mem()) {
+            // (an arena of the driver's memory, or chunks the GPU maps, grow back here, the GPU's work done first - never on the read
+            //  path, see regrow_need and take_slot)
+            if (store->own_mem() || store->gpu_mapped()) {
                 const uint64_t need = store->regrow_need();
                 if (need > 0 && avail >= need) {
                     cudaSetDevice(devs[0].id);
