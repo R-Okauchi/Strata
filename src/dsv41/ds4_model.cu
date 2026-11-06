@@ -45,6 +45,9 @@
 
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
+#if !defined(STRATA_USE_HIP) && !defined(STRATA_METAL)
+#include <cuda.h>   // (the driver API's types: HostNumaArena takes its entry points from the runtime, no link to libcuda)
+#endif
 
 #if defined(STRATA_METAL)
 extern "C" void ds4_busy_begin();
@@ -301,6 +304,124 @@ bool gpu_integrated(int dev) {
     return v != 0;
 #endif
 }
+#if !defined(STRATA_USE_HIP) && !defined(STRATA_METAL) && CUDART_VERSION >= 12020
+// The RAM store's arena from the driver, for a GPU that shares the PC's memory: pinned host memory from cuMemCreate on the GPU's
+// host NUMA node, mapped at one address for the CPU and the GPU.  The expert kernels read it at the rate they read their own
+// allocations; the system's pages pinned with cudaHostRegister (the arena otherwise) at two thirds of that - GB10, 9 MiB blocks at
+// random places of 6 GiB: 240 against 163 GB/s, the same with the kernel's 2 MiB pages (160).  The store's O_DIRECT reads into it
+// (10.1 GB/s) and the CPU's reads of it (95 GB/s, 8 threads) were as fast as into and of the system's pages.  The pieces are
+// mapped in the driver's granularity: a chunk's piece runs from its start rounded up to its end rounded up, so a chunk's first
+// bytes may lie in the piece before it (chunks are given back from the end, so that piece outlives it).
+class HostNumaArena {
+public:
+    // whether this GPU can have such memory (the entry points found, one granule made, mapped and given back)
+    bool init(int dev) {
+        dev_ = dev;
+        if (!drv(create_, "cuMemCreate") || !drv(release_, "cuMemRelease") || !drv(map_, "cuMemMap") ||
+            !drv(unmap_, "cuMemUnmap") || !drv(access_, "cuMemSetAccess") || !drv(reserve_, "cuMemAddressReserve") ||
+            !drv(free_va_, "cuMemAddressFree") || !drv(gran_of_, "cuMemGetAllocationGranularity"))
+            return false;
+        int numa = -1;
+        if (cudaDeviceGetAttribute(&numa, cudaDevAttrHostNumaId, dev) != cudaSuccess || numa < 0) {
+            (void) cudaGetLastError();
+            numa = 0;
+        }
+        prop_.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+        prop_.location.type = CU_MEM_LOCATION_TYPE_HOST_NUMA;
+        prop_.location.id = numa;
+        acc_[0].location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+        acc_[0].location.id = dev;
+        acc_[0].flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+        acc_[1].location.type = CU_MEM_LOCATION_TYPE_HOST_NUMA;
+        acc_[1].location.id = numa;
+        acc_[1].flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+        if (gran_of_(&gran_, &prop_, CU_MEM_ALLOC_GRANULARITY_RECOMMENDED) != CUDA_SUCCESS || gran_ == 0) return false;
+        void* probe = reserve(gran_);
+        if (probe == nullptr) return false;
+        const bool ok = commit(probe, gran_);
+        if (ok) decommit(probe, gran_);
+        release(probe, gran_);
+        return ok;
+    }
+    size_t granularity() const { return gran_; }
+    void* reserve(size_t bytes) {
+        CUdeviceptr va = 0;
+        if (reserve_(&va, up(bytes), gran_, 0, 0) != CUDA_SUCCESS) return nullptr;
+        return (void*) va;
+    }
+    bool commit(void* p, size_t bytes) {
+        const uintptr_t a = up((uintptr_t) p), b = up((uintptr_t) p + bytes);
+        std::lock_guard<std::mutex> lk(mu_);
+        if (b <= a) {   // (all of it in the piece before)
+            pieces_[(uintptr_t) p] = {a, 0, 0};
+            return true;
+        }
+        CUmemGenericAllocationHandle h = 0;
+        cudaSetDevice(dev_);
+        if (create_(&h, b - a, &prop_, 0) != CUDA_SUCCESS) return false;
+        if (map_((CUdeviceptr) a, b - a, 0, h, 0) != CUDA_SUCCESS) {
+            release_(h);
+            return false;
+        }
+        if (access_((CUdeviceptr) a, b - a, acc_, 2) != CUDA_SUCCESS) {
+            unmap_((CUdeviceptr) a, b - a);
+            release_(h);
+            return false;
+        }
+        pieces_[(uintptr_t) p] = {a, b - a, h};
+        return true;
+    }
+    void decommit(void* p, size_t) {
+        std::lock_guard<std::mutex> lk(mu_);
+        const auto it = pieces_.find((uintptr_t) p);
+        if (it == pieces_.end()) return;
+        if (it->second.bytes > 0) {
+            unmap_((CUdeviceptr) it->second.at, it->second.bytes);
+            release_(it->second.h);
+        }
+        pieces_.erase(it);
+    }
+    void release(void* p, size_t bytes) { free_va_((CUdeviceptr) p, up(bytes)); }
+
+private:
+    struct Piece {
+        uintptr_t at = 0;
+        size_t bytes = 0;
+        CUmemGenericAllocationHandle h = 0;
+    };
+    template <class F>
+    static bool drv(F& f, const char* name) {
+        void* fp = nullptr;
+        cudaDriverEntryPointQueryResult q = cudaDriverEntryPointSymbolNotFound;
+#if CUDART_VERSION >= 12050
+        const cudaError_t e = cudaGetDriverEntryPointByVersion(name, &fp, 12020, cudaEnableDefault, &q);
+#else
+        const cudaError_t e = cudaGetDriverEntryPoint(name, &fp, cudaEnableDefault, &q);
+#endif
+        if (e != cudaSuccess || q != cudaDriverEntryPointSuccess) {
+            (void) cudaGetLastError();
+            fp = nullptr;
+        }
+        f = reinterpret_cast<F>(fp);
+        return fp != nullptr;
+    }
+    size_t up(size_t v) const { return (v + gran_ - 1) / gran_ * gran_; }
+    decltype(&cuMemCreate) create_ = nullptr;
+    decltype(&cuMemRelease) release_ = nullptr;
+    decltype(&cuMemMap) map_ = nullptr;
+    decltype(&cuMemUnmap) unmap_ = nullptr;
+    decltype(&cuMemSetAccess) access_ = nullptr;
+    decltype(&cuMemAddressReserve) reserve_ = nullptr;
+    decltype(&cuMemAddressFree) free_va_ = nullptr;
+    decltype(&cuMemGetAllocationGranularity) gran_of_ = nullptr;
+    CUmemAllocationProp prop_ = {};
+    CUmemAccessDesc acc_[2] = {};
+    size_t gran_ = 0;
+    int dev_ = 0;
+    std::mutex mu_;
+    std::map<uintptr_t, Piece> pieces_;   // commit's p -> the piece mapped for it
+};
+#endif
 // cudaMemGetInfo for the current device, with uma_free's view on an integrated GPU (Maya v1.1.20's mem_info; the Windows APU
 // dedicated-memory clamp (strata/platform/dedicated.hpp) is not ported: commit_charged covers that PC here)
 cudaError_t mem_info(size_t* free_b, size_t* total_b) {
@@ -1430,6 +1551,7 @@ struct Model::Impl {
                                        // memory; DS4_STORE_STAGE=0/1 decides anywhere)
     bool zc_in_place = false;          // the store's slots read in place, by decode tokens and verify windows alike
     bool flow_in_place = false;        // the prompt path reads the store's experts where they lie too (zc_in_place; CUDA)
+    bool store_numa = false;           // the store's arena is the driver's host memory (HostNumaArena, opt-in), not registered pages
     // DS4_UMA_TIER=1 on one GPU that shares the PC's memory (a DGX Spark's GB10): one expert tier instead of two. The
     // trunk's experts get no VRAM slots (on such a GPU those are the same RAM, copied there and kept apart from the CPU
     // lane's); the RAM store takes that memory, the GPU reads its slots in place for decode tokens and verify windows,
@@ -6687,7 +6809,28 @@ struct Model::Impl {
                                  "register up to %.1f GB more), so this will likely fail with a GPU fault. The store is the same RAM either way, zero-copy gains nothing here; "
                                  "leave DS4_STORE_ZC off.\n", (double) zfree / 1e9, gb);
             }
-            cfg.map_chunk = [dev0](void* h, size_t n) -> void* {
+#if !defined(STRATA_USE_HIP) && !defined(STRATA_METAL) && CUDART_VERSION >= 12020
+            {   // read in place (below: a GPU that shares the PC's memory, no staging copy asked for): the arena from the driver
+                // (HostNumaArena) - DS4_STORE_NUMA=0 keeps the system's pages, registered
+                const char* sv = std::getenv("DS4_STORE_STAGE");
+                const char* nv = std::getenv("DS4_STORE_NUMA");   // (opt-in: see flow_in_place below)
+                if (gpu_integrated(dev0) && !(sv != nullptr && std::atoi(sv) != 0) && nv != nullptr && std::atoi(nv) != 0) {
+                    auto na = std::make_shared<HostNumaArena>();
+                    cudaSetDevice(dev0);
+                    if (na->init(dev0)) {
+                        cfg.arena_reserve = [na](size_t n) { return na->reserve(n); };
+                        cfg.arena_commit = [na](void* p, size_t n) { return na->commit(p, n); };
+                        cfg.arena_decommit = [na](void* p, size_t n) { na->decommit(p, n); };
+                        cfg.arena_release = [na](void* p, size_t n) { na->release(p, n); };
+                        cfg.map_chunk = [](void* h, size_t) -> void* { return h; };   // (one address for the CPU and the GPU)
+                        store_numa = true;
+                    } else
+                        std::fprintf(stderr, "ds4: RAM store: no host NUMA memory from the driver (cuMemCreate): the arena is the system's "
+                                             "pages, registered for the GPU\n");
+                }
+            }
+#endif
+            if (!store_numa) cfg.map_chunk = [dev0](void* h, size_t n) -> void* {
                 cudaSetDevice(dev0);
                 unsigned reg_flags = cudaHostRegisterMapped | cudaHostRegisterPortable;
 #if defined(STRATA_USE_HIP)
@@ -6707,7 +6850,7 @@ struct Model::Impl {
                 if (d != h) std::fprintf(stderr, "ds4: RAM store: chunk host %p -> device %p (not the identity)\n", h, d);
                 return d;
             };
-            cfg.unmap_chunk = [dev0](void* h) {
+            if (!store_numa) cfg.unmap_chunk = [dev0](void* h) {
                 cudaSetDevice(dev0);
                 cudaHostUnregister(h);
             };
@@ -6760,13 +6903,16 @@ struct Model::Impl {
             // 581 GB for 112K tokens, the RAM's bandwidth the GPU needs (DS4_FLOW_IN_PLACE=0: copied as before)
             {
                 const char* fv = std::getenv("DS4_FLOW_IN_PLACE");
-                flow_in_place = zc_in_place && !copy_mode && !(fv != nullptr && std::atoi(fv) == 0);
+                // (not with the driver's arena: the prompt's tile kernels read it 2.3x slower than registered pages on a
+                //  GB10 - 5.0 against 2.2 s of a 1308-token prompt's experts - where the decode's read it as fast or faster)
+                flow_in_place = zc_in_place && !copy_mode && !store_numa && !(fv != nullptr && std::atoi(fv) == 0);
             }
 #endif
             std::fprintf(stderr, "ds4: RAM store: the GPU takes its slots %s, %zu slots kept evictable%s\n",
                          !zc_on ? "over PCIe (off)"
                          : zc_copy ? "over PCIe (copied into a staging area at the PCIe rate first)"
-                                   : "where they lie (its memory is the PC's: no copy)",
+                         : store_numa ? "where they lie (its memory is the PC's: no copy; the arena the driver's host memory)"
+                                      : "where they lie (its memory is the PC's: no copy)",
                          cfg.reserve, flow_in_place ? "; prompts read them in place too" : "");
         }
     }
@@ -8935,13 +9081,27 @@ struct Model::Impl {
         store_watch();
     }
     // the store gives RAM back when the PC runs short (the owner opened something): below 4 GB free, a 0.7 GB chunk at a time
-    // until 5 GB are free again (checked every 16 windows); it grows again by itself once 8 GB beside its chunk are free
+    // until 5 GB are free again (checked every 16 windows); it grows again by itself once 8 GB beside its chunk are free (an
+    // arena of the driver's memory here, a chunk at a check)
     void store_watch() {
         if (!store) return;
         static int tick = 0;
         if (++tick % 16 != 0) return;
         const uint64_t avail = ram_avail();
-        if (avail == ~uint64_t{0} || avail >= (4ull << 30)) return;
+        if (avail == ~uint64_t{0}) return;
+        if (avail >= (4ull << 30)) {
+            // (an arena of the driver's memory grows back here, the GPU's work done first - never on the read path, see regrow_need)
+            if (store->own_mem()) {
+                const uint64_t need = store->regrow_need();
+                if (need > 0 && avail >= need) {
+                    cudaSetDevice(devs[0].id);
+                    if (cudaStreamSynchronize(devs[0].st) != cudaSuccess) (void) cudaGetLastError();
+                    if (store->grow_some())
+                        std::fprintf(stderr, "ds4: RAM store: %.1f GB free: a chunk back (%zu slots)\n", avail / 1e9, store->slots_allocated());
+                }
+            }
+            return;
+        }
         const size_t chunks = 1 + (size_t) (((5ull << 30) - avail) / (700ull << 20));
         size_t want = chunks;
         if (store->gpu_mapped()) {   // (the GPU reads slots in place: off its tables, and its work done, before any chunk goes)

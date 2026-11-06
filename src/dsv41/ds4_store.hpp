@@ -69,6 +69,12 @@ public:
         // a new chunk of the arena for the GPU to read in place: returns the device address of `host` (null: not visible)
         std::function<void*(void* host, size_t bytes)> map_chunk;
         std::function<void(void* host)> unmap_chunk;
+        // the arena's memory, when not the system's pages (all four set, or none: os::range_*): a range reserved, then made real
+        // a chunk at a time from its start and given back from its end (decommit gets the (p, bytes) commit got), then released
+        std::function<void*(size_t bytes)> arena_reserve;
+        std::function<bool(void* p, size_t bytes)> arena_commit;
+        std::function<void(void* p, size_t bytes)> arena_decommit;
+        std::function<void(void* p, size_t bytes)> arena_release;
         size_t reserve = 192;              // slots kept evictable (not visible) for the window's demand and guesses
         int vis_percent = 100;             // the share of experts the GPU may take (by a fixed hash): the rest stay the CPU lane's, so both lanes work
         // bytes of blobs each layer's experts may hold (the budget's share of the hottest, per layer): slot classes sized from it;
@@ -130,7 +136,7 @@ public:
         for (Cls& k : cls_) {   // one reserved range a class (chunks committed as they are needed); the reserve in proportion
             k.reserve = cls_.size() == 1 ? c.reserve : std::max<size_t>(8, (size_t) ((double) c.reserve * (double) k.nmax / (double) nmax_));
             k.arena_bytes = ((k.nmax + kChunk - 1) / kChunk) * kChunk * k.slot_bytes;
-            k.arena = (uint8_t*) os::range_reserve(k.arena_bytes);
+            k.arena = (uint8_t*) (own_mem() ? cfg_.arena_reserve(k.arena_bytes) : os::range_reserve(k.arena_bytes));
             if (k.arena == nullptr) return false;
         }
         slots_.reset(new Slot[nmax_]);
@@ -162,9 +168,13 @@ public:
     ~ExpertStore() {
         io_.reset();
         for (Cls& k : cls_) {
-            for (size_t i = 0; i < k.chunks.size(); ++i)
+            if (k.arena == nullptr) continue;
+            for (size_t i = k.chunks.size(); i-- > 0;) {
                 if (cfg_.unmap_chunk && k.chunk_dev[i] != nullptr) cfg_.unmap_chunk(k.chunks[i].first);
-            os::range_release(k.arena, k.arena_bytes);
+                if (own_mem()) cfg_.arena_decommit(k.chunks[i].first, k.chunks[i].second);
+            }
+            if (own_mem()) cfg_.arena_release(k.arena, k.arena_bytes);
+            else os::range_release(k.arena, k.arena_bytes);
         }
     }
 
@@ -527,7 +537,8 @@ public:
             }
             const size_t c = pc.second;
             if (cfg_.unmap_chunk && k.chunk_dev[c] != nullptr) cfg_.unmap_chunk(k.chunks[c].first);
-            os::range_decommit(k.chunks[c].first, k.chunks[c].second);
+            if (own_mem()) cfg_.arena_decommit(k.chunks[c].first, k.chunks[c].second);
+            else os::range_decommit(k.chunks[c].first, k.chunks[c].second);
             k.chunks.pop_back();
             k.chunk_dev.pop_back();
             k.nalloc = c * kChunk;
@@ -538,6 +549,23 @@ public:
         return done;
     }
     size_t shrunk() const { return shrunk_; }
+    /// the arena's memory is the caller's (Cfg::arena_*), not the system's pages
+    bool own_mem() const { return cfg_.arena_reserve && cfg_.arena_commit && cfg_.arena_decommit && cfg_.arena_release; }
+    /// Own memory grows back here, after shrink_chunks, never on the read path (making it real may wait on the GPU's work, and a
+    /// kernel may be waiting on the CPU lane): the RAM grow_some() needs free for its next chunk (its bytes and the floor), 0 when
+    /// the arena is whole; grow_some() adds that chunk to the class furthest below its size, at the caller's safe point.
+    uint64_t regrow_need() {
+        std::lock_guard<std::mutex> lk(mu_);
+        const int k = regrow_class();
+        if (k < 0) return 0;
+        const Cls& c = cls_[(size_t) k];
+        return (uint64_t) (std::min(kChunk, c.nmax - c.nalloc) * c.slot_bytes) + cfg_.floor_bytes;
+    }
+    bool grow_some() {
+        std::lock_guard<std::mutex> lk(mu_);
+        const int k = regrow_class();
+        return k >= 0 && grow(k);
+    }
     /// An expert VRAM took over: no longer a visible slot
     void unmark(int layer, int e) {
         if (layer < 0 || layer >= (int) where_.size()) return;
@@ -655,7 +683,7 @@ private:
         const uint64_t avail = cfg_.ram_avail ? cfg_.ram_avail() : ~uint64_t{0};
         if (avail != ~uint64_t{0} && avail < bytes + cfg_.floor_bytes) return false;
         void* p = k.arena + k.nalloc * k.slot_bytes;
-        if (!os::range_commit(p, bytes)) return false;
+        if (!(own_mem() ? cfg_.arena_commit(p, bytes) : os::range_commit(p, bytes))) return false;
         k.chunks.push_back({p, bytes});
         void* dev = cfg_.map_chunk ? cfg_.map_chunk(p, bytes) : nullptr;
         k.chunk_dev.push_back(dev);
@@ -684,6 +712,18 @@ private:
         }
         return plan;
     }
+    int regrow_class() const {   // the class furthest below its size, in bytes (-1: none).  mu_ held.
+        int best = -1;
+        size_t bb = 0;
+        for (size_t k = 0; k < cls_.size(); ++k) {
+            const size_t b = (cls_[k].nmax - cls_[k].nalloc) * cls_[k].slot_bytes;
+            if (b > bb) {
+                best = (int) k;
+                bb = b;
+            }
+        }
+        return best;
+    }
     // the slot to give up (or a free one): the policy's lowest among the unpinned, not visible, ready ones.  mu_ held.
     int take_slot(int ci, bool demand) {
         Cls& k = cls_[(size_t) ci];
@@ -692,7 +732,7 @@ private:
                 k.free_hint = j + 1;
                 return (int) (k.off + j);
             }
-        if (grow(ci)) return take_slot(ci, demand);
+        if (!own_mem() && grow(ci)) return take_slot(ci, demand);   // (own memory grows back at the caller's safe point: grow_some)
         int best = -1;
         double bv = 0;
         for (size_t j = 0; j < k.nalloc; ++j) {
