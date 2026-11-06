@@ -257,6 +257,9 @@ __global__ void __launch_bounds__(kThreads) hc_mix_kernel(const float* __restric
     const float* w = fn + (size_t) m * hcdim;
     const float* x = h + (size_t) t * hcdim;
     float acc = 0.0f, ss = 0.0f;
+    // (unrolled: a thread's next loads go out before its sums - a token's mixes are 24 blocks, one a mix, each latency-bound
+    //  on its 20 steps of 20480 values; the same sums in the same order)
+#pragma unroll 4
     for (int k = threadIdx.x * 4; k < hcdim; k += kThreads * 4) {
         const float4 hv = *(const float4*) (x + k);
         const float4 wv = *(const float4*) (w + k);
@@ -358,6 +361,9 @@ __global__ void __launch_bounds__(kThreads) hc_mix_split_kernel(const float* __r
     const float* w = fn + (size_t) m * hcdim;
     const float* x = h + (size_t) t * hcdim;
     float acc = 0.0f, ss = 0.0f;
+    // (unrolled: a thread's next loads go out before its sums - a token's mixes are 24 blocks, one a mix, each latency-bound
+    //  on its 20 steps of 20480 values; the same sums in the same order)
+#pragma unroll 4
     for (int k = threadIdx.x * 4; k < hcdim; k += kThreads * 4) {
         const float4 hv = *(const float4*) (x + k);
         const float4 wv = *(const float4*) (w + k);
